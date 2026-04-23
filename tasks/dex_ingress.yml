@@ -1,0 +1,56 @@
+---
+# =============================================================================
+# Ensure the Dex ingress is bound to the PaletteAI host.
+#
+# The Helm chart ships the dex ingress with no `host` (wildcard). When the
+# canvas ingress claims `paletteai.isc-spectro-dev.click` with path `/ai`,
+# nginx prefers the more-specific host rule and returns 404 for `/dex/*`
+# on that hostname. Binding the dex ingress to the same host fixes this
+# without changing the canvas ingress.
+# =============================================================================
+- name: Check current dex ingress host binding
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - -n
+      - "{{ paletteai_namespace }}"
+      - get
+      - ingress
+      - dex
+      - -o
+      - jsonpath={.spec.rules[0].host}
+  register: dex_ingress_host
+  changed_when: false
+
+- name: Bind dex ingress to PaletteAI host if missing or wrong
+  when: dex_ingress_host.stdout != paletteai_domain
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - -n
+      - "{{ paletteai_namespace }}"
+      - patch
+      - ingress
+      - dex
+      - --type=json
+      - -p
+      - >-
+        [{"op":"replace","path":"/spec/rules/0","value":{
+           "host":"{{ paletteai_domain }}",
+           "http":{"paths":[{
+             "backend":{"service":{"name":"dex","port":{"number":5556}}},
+             "path":"/dex",
+             "pathType":"ImplementationSpecific"
+           }]}
+         }}]
+  changed_when: true
+
+- name: Verify /dex reachable from outside
+  ansible.builtin.uri:
+    url: "https://{{ paletteai_domain }}/dex/.well-known/openid-configuration"
+    validate_certs: false
+    status_code: 200
+  register: dex_discovery
+  retries: 5
+  delay: 3
+  until: dex_discovery.status == 200

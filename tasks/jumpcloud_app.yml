@@ -1,0 +1,245 @@
+---
+# =============================================================================
+# JumpCloud: create or find the PaletteAI SAML application, activate it,
+# and fetch the IdP metadata XML.
+# =============================================================================
+- name: List existing JumpCloud applications
+  ansible.builtin.uri:
+    url: "https://console.jumpcloud.com/api/applications?limit=100"
+    headers:
+      x-api-key: "{{ jumpcloud_api_key }}"
+    return_content: true
+  register: jc_apps
+
+- name: Find existing PaletteAI app by ssoUrl
+  ansible.builtin.set_fact:
+    jumpcloud_app_existing: >-
+      {{ jc_apps.json['results'] |
+         selectattr('ssoUrl', 'defined') |
+         selectattr('ssoUrl', 'equalto', jumpcloud_idp_url) |
+         list | first | default({}) }}
+
+- name: Delete existing app if it has an SP certificate configured
+  when:
+    - jumpcloud_app_existing._id is defined
+    - jumpcloud_app_existing.config.spCertificate.value | default('') | length > 0
+  ansible.builtin.uri:
+    url: "https://console.jumpcloud.com/api/applications/{{ jumpcloud_app_existing._id }}"
+    method: DELETE
+    headers:
+      x-api-key: "{{ jumpcloud_api_key }}"
+    status_code: [200, 204]
+  register: app_deleted
+
+- name: Reset existing-app fact if deleted
+  when: app_deleted.status | default(0) == 200
+  ansible.builtin.set_fact:
+    jumpcloud_app_existing: {}
+
+- name: Create JumpCloud SAML app (no SP cert - avoids AuthnRequest sig issues)
+  when: jumpcloud_app_existing._id is not defined
+  ansible.builtin.uri:
+    url: "https://console.jumpcloud.com/api/applications"
+    method: POST
+    headers:
+      x-api-key: "{{ jumpcloud_api_key }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      name: "saml2"
+      displayName: "SAML2.0"
+      displayLabel: "{{ jumpcloud_app_label }}"
+      ssoUrl: "{{ jumpcloud_idp_url }}"
+      description: ""
+      beta: false
+      sso:
+        type: "saml"
+        hidden: false
+      config:
+        idpEntityId:
+          value: "{{ jumpcloud_idp_url }}"
+          type: text
+          label: "IdP Entity ID:"
+          required: true
+          visible: true
+          position: 0
+        idpPrivateKey:
+          value: ""
+          type: file
+          label: "IdP Private Key:"
+          required: true
+          visible: true
+          position: 1
+        idpCertificate:
+          value: ""
+          type: file
+          label: "IdP Certificate:"
+          required: false
+          visible: true
+          position: 2
+        spEntityId:
+          value: "https://{{ paletteai_domain }}/dex/callback"
+          type: text
+          label: "SP Entity ID:"
+          required: true
+          visible: true
+          position: 3
+        acsUrl:
+          value: "https://{{ paletteai_domain }}/dex/callback"
+          type: text
+          label: "ACS URL:"
+          required: true
+          visible: true
+          position: 4
+        spCertificate:
+          value: ""
+          type: file
+          label: "SP Certificate:"
+          required: false
+          visible: true
+          position: 5
+        subjectField:
+          value: "email"
+          type: select
+          label: "SAMLSubject NameID:"
+          required: true
+          visible: true
+          position: 6
+        overrideNameIdFormat:
+          value: "urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified"
+          type: select
+          label: "SAMLSubject NameID Format:"
+          required: true
+          visible: true
+          position: 7
+        constantAttributes:
+          value: []
+          type: constantAttributes
+          label: "Constant Attributes:"
+          required: false
+          visible: true
+          mutable: true
+          position: 8
+        databaseAttributes:
+          value:
+            - {name: "email",     value: "email",     required: false, visible: true, readOnly: false}
+            - {name: "firstName", value: "firstname", required: false, visible: true, readOnly: false}
+            - {name: "lastName",  value: "lastname",  required: false, visible: true, readOnly: false}
+          type: constantAttributes
+          label: "User Attributes:"
+          required: false
+          visible: true
+          mutable: true
+          position: 9
+        includeGroups:
+          value: true
+          type: bool
+          label: "Include Group Attribute"
+          required: false
+          visible: true
+          position: 10
+        groupsAttributeName:
+          value: "{{ jumpcloud_groups_attr_name }}"
+          type: text
+          label: "Groups Attribute Name"
+          required: false
+          visible: true
+          position: 11
+        signatureAlgorithm:
+          value: "RSA-SHA256"
+          type: select
+          label: "Signature Algorithm:"
+          required: true
+          visible: true
+          position: 12
+        signAssertion:
+          value: true
+          type: bool
+          label: "Sign Assertion"
+          required: false
+          visible: true
+          position: 13
+        signResponse:
+          value: false
+          type: bool
+          label: "Sign Response"
+          required: false
+          visible: false
+          position: 13
+        defaultTargetUrl:
+          value: ""
+          type: text
+          label: "Default RelayState"
+          required: false
+          visible: true
+          position: 14
+        idpInitUrl:
+          # Tile click in the JumpCloud user portal navigates here instead
+          # of POSTing to the ACS URL. This forces SP-initiated SAML, which
+          # Dex requires (it does not support IdP-initiated flows).
+          value: "https://{{ paletteai_domain }}/ai"
+          type: text
+          label: "Login URL:"
+          required: false
+          visible: true
+          position: 15
+    status_code: [200, 201]
+    return_content: true
+  register: app_created
+
+- name: Set JumpCloud app ID
+  ansible.builtin.set_fact:
+    jumpcloud_app_id: >-
+      {{ app_created.json._id
+         if app_created is defined and app_created.json is defined
+         else jumpcloud_app_existing._id }}
+
+- name: Fetch app full state for activation PUT
+  ansible.builtin.uri:
+    url: "https://console.jumpcloud.com/api/applications/{{ jumpcloud_app_id }}"
+    headers:
+      x-api-key: "{{ jumpcloud_api_key }}"
+    return_content: true
+  register: app_full
+
+- name: Override idpInitUrl to force SP-initiated flow on tile click
+  ansible.builtin.set_fact:
+    app_config_overrides: >-
+      {{ (app_full.json.config | default({})) | combine({
+           'idpInitUrl': (app_full.json.config.idpInitUrl | default({}))
+              | combine({
+                  'value': 'https://' ~ paletteai_domain ~ '/ai',
+                  'type': 'text',
+                  'label': 'Login URL:',
+                  'required': false,
+                  'visible': true,
+                  'position': 15
+                })
+         }, recursive=False) }}
+
+- name: Build activation payload (full body with active=true + idpInitUrl override)
+  ansible.builtin.set_fact:
+    app_activate_body: >-
+      {{ app_full.json
+         | combine({'active': true, 'config': app_config_overrides})
+         | dict2items
+         | rejectattr('key', 'in', ['_id','id','organization','logo','created','parentApp','sso'])
+         | items2dict }}
+
+- name: Activate JumpCloud app (full-body PUT)
+  ansible.builtin.uri:
+    url: "https://console.jumpcloud.com/api/applications/{{ jumpcloud_app_id }}"
+    method: PUT
+    headers:
+      x-api-key: "{{ jumpcloud_api_key }}"
+      Content-Type: application/json
+    body_format: json
+    body: "{{ app_activate_body }}"
+    status_code: [200]
+    return_content: true
+
+- name: Fetch JumpCloud IdP metadata XML
+  ansible.builtin.uri:
+    url: "https://sso.jumpcloud.com/saml2/metadata/{{ jumpcloud_app_id }}"
+    return_content: true
+  register: jc_metadata

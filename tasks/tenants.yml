@@ -1,0 +1,128 @@
+---
+# =============================================================================
+# Reconcile PaletteAI tenants.
+#
+# For each tenant we apply three resources in order:
+#   1. A namespace named <tenant.name>   (required — project name must match
+#      the namespace per the validating webhook)
+#   2. A Tenant CR                        (declares the tenantRoleMapping that
+#      links SAML groups to tenant-admin role)
+#   3. A Project CR                       (the project reconciler is what
+#      actually creates the RoleBinding inside tenant-<name> that grants
+#      SAML group members access; without a project, the tenant exists but
+#      the UI won't list it for the logged-in user)
+# =============================================================================
+- name: Apply tenant resources
+  ansible.builtin.command:
+    cmd: kubectl apply -f -
+    stdin: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: {{ item.name }}
+      ---
+      apiVersion: spectrocloud.com/v1alpha1
+      kind: Tenant
+      metadata:
+        name: {{ item.name }}
+      spec:
+        displayName: "{{ item.displayName }}"
+        tenantRoleMapping:
+          groups:
+            - "{{ item.jumpcloudGroup }}"
+      ---
+      apiVersion: spectrocloud.com/v1alpha1
+      kind: Project
+      metadata:
+        name: {{ item.name }}
+        namespace: {{ item.name }}
+        labels:
+          palette.ai/tenant-name: {{ item.name }}
+      spec:
+        displayName: "{{ item.displayName }} Project"
+        tenantRef:
+          name: {{ item.name }}
+        computeConfigRef:
+          name: default
+          namespace: default
+        settingsRef:
+          name: default
+        roleMapping:
+          admin:
+            - admin
+          editor:
+            - editor
+          viewer:
+            - viewer
+        admissionConfiguration:
+          workloadConfiguration:
+            deploymentNamespaces:
+              allow:
+                - {{ item.name }}
+              disallow:
+                - "*"
+  loop: "{{ paletteai_tenants }}"
+  loop_control:
+    label: "{{ item.name }} ← {{ item.jumpcloudGroup }}"
+  changed_when: true
+
+- name: Wait for tenant namespaces to be created
+  ansible.builtin.command: >
+    kubectl get ns tenant-{{ item.name }}
+    -o jsonpath={.status.phase}
+  register: ns_check
+  retries: 12
+  delay: 5
+  until: ns_check.stdout == "Active"
+  loop: "{{ paletteai_tenants }}"
+  loop_control:
+    label: "tenant-{{ item.name }}"
+  changed_when: false
+
+- name: Wait for each project's RoleBinding to contain the tenant's group
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - -n
+      - "tenant-{{ item.name }}"
+      - get
+      - "rolebinding/{{ item.name }}-mural-tenant-viewer"
+      - -o
+      - "jsonpath={.subjects[?(@.name=='{{ item.jumpcloudGroup }}')].name}"
+  register: rb_check
+  retries: 12
+  delay: 5
+  until: rb_check.stdout == item.jumpcloudGroup
+  loop: "{{ paletteai_tenants }}"
+  loop_control:
+    label: "{{ item.name }}: {{ item.jumpcloudGroup }}"
+  changed_when: false
+
+- name: Show reconciled tenants
+  ansible.builtin.command: kubectl get tenants -o wide
+  register: tenants_out
+  changed_when: false
+
+- name: Display tenant list
+  ansible.builtin.debug:
+    msg: "{{ tenants_out.stdout_lines }}"
+
+- name: Prune tenants not in input (opt-in)
+  when: paletteai_tenants_prune | bool
+  block:
+    - name: List existing tenants
+      ansible.builtin.command: kubectl get tenants -o jsonpath={.items[*].metadata.name}
+      register: existing_tenants_raw
+      changed_when: false
+
+    - name: Compute tenants to delete
+      ansible.builtin.set_fact:
+        tenants_to_delete: >-
+          {{ (existing_tenants_raw.stdout | split(' ') | select('length') | list)
+             | difference(paletteai_tenants | map(attribute='name') | list) }}
+
+    - name: Delete tenants not in input
+      ansible.builtin.command: kubectl delete tenant {{ item }}
+      loop: "{{ tenants_to_delete }}"
+      changed_when: true
+      when: tenants_to_delete | length > 0

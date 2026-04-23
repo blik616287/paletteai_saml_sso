@@ -1,0 +1,24 @@
+---
+# =============================================================================
+# For each tenant: ensure its JumpCloud user group exists, add members,
+# and associate with the PaletteAI SAML app.
+# =============================================================================
+- name: Paginate JumpCloud user groups
+  ansible.builtin.uri:
+    url: "https://console.jumpcloud.com/api/v2/usergroups?limit=100&skip={{ item }}"
+    headers:
+      x-api-key: "{{ jumpcloud_api_key }}"
+    return_content: true
+  register: jc_groups_pages
+  loop: "{{ range(0, 1000, 100) | list }}"
+
+- name: Flatten all JumpCloud groups
+  ansible.builtin.set_fact:
+    all_jc_groups: "{{ jc_groups_pages.results | map(attribute='json') | flatten }}"
+
+- name: Create/find JumpCloud group for each tenant
+  ansible.builtin.include_tasks: jumpcloud_group_one.yml
+  loop: "{{ paletteai_tenants }}"
+  loop_control:
+    loop_var: tenant
+    label: "{{ tenant.name }} ← {{ tenant.jumpcloudGroup }}"

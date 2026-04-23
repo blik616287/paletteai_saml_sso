@@ -1,0 +1,42 @@
+# Ansible
+*.retry
+.ansible/
+collections/
+roles/
+facts.d/
+
+# Vault / secrets
+.vault_pass
+.vault_pass.*
+vault_password
+.env
+.env.*
+*.pem
+*.key
+*.kubeconfig
+kubeconfig
+secrets.yml
+secrets.yaml
+sso-env.sh
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Logs / temp
+*.log
+*.tmp
+/tmp/

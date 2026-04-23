@@ -1,0 +1,33 @@
+# =============================================================================
+# Environment variables for the PaletteAI JumpCloud SSO integration.
+#
+# Copy to sso-env.sh and fill in the real values. The unsuffixed filename
+# is gitignored so secrets won't get committed.
+#
+#   cp sso-env.sh.example sso-env.sh
+#   chmod 600 sso-env.sh
+#   # edit sso-env.sh
+#   source sso-env.sh
+# =============================================================================
+
+# --- Required ---------------------------------------------------------------
+# JumpCloud admin API key.
+export JUMPCLOUD_API_KEY='jca_REPLACE_ME'
+
+# --- Optional overrides (defaults live in inventory/group_vars/all.yml) -----
+# export PALETTEAI_DOMAIN='paletteai.example.com'
+# export PALETTEAI_NAMESPACE='mural-system'
+# export JUMPCLOUD_APP_LABEL='PaletteAI'
+# export JUMPCLOUD_IDP_URL_SLUG='paletteai'
+# export JUMPCLOUD_GROUPS_ATTR='memberOf'
+# export PALETTEAI_TENANTS_PRUNE='false'
+# export PALETTEAI_TENANTS_TEARDOWN='false'
+
+# Note: the tenant list (paletteai_tenants) is a YAML list in
+# inventory/group_vars/all.yml — not an env var. Edit that file to add
+# tenants, change member lists, or retarget JumpCloud groups.
+
+# PaletteAI requires kubectl pointed at the PaletteAI EKS cluster before
+# running the playbook:
+#   aws eks update-kubeconfig --name spectroihmeae-ue2-paletteai \
+#       --region us-east-2 --profile spectro

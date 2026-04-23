@@ -1,0 +1,156 @@
+---
+# =============================================================================
+# Parse JumpCloud IdP metadata, build a Dex SAML connector, patch the
+# Dex secret, and restart Dex.
+# =============================================================================
+- name: Write metadata XML to a temp file for reliable parsing
+  ansible.builtin.copy:
+    content: "{{ jc_metadata.content }}"
+    dest: /tmp/jc_metadata.xml
+    mode: "0600"
+  changed_when: false
+
+- name: Parse metadata with Python (handles multi-line cert robustly)
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - |
+        import json, re, sys
+        x = open('/tmp/jc_metadata.xml').read()
+        entity = re.search(r'entityID="([^"]+)"', x).group(1)
+        sso = re.search(r'Binding="urn:oasis:names:tc:SAML:2\.0:bindings:HTTP-POST"[^>]*Location="([^"]+)"', x)
+        if not sso:
+            sso = re.search(r'Location="([^"]+)"[^>]*Binding="urn:oasis:names:tc:SAML:2\.0:bindings:HTTP-POST"', x)
+        cert = re.search(r'<(?:ds:)?X509Certificate>(.*?)</(?:ds:)?X509Certificate>', x, re.DOTALL).group(1)
+        cert = re.sub(r'\s+', '', cert)
+        pem = '-----BEGIN CERTIFICATE-----\n'
+        for i in range(0, len(cert), 64):
+            pem += cert[i:i+64] + '\n'
+        pem += '-----END CERTIFICATE-----\n'
+        print(json.dumps({'entityId': entity, 'ssoUrl': sso.group(1), 'caPem': pem}))
+  register: parsed
+  changed_when: false
+
+- name: Store parsed IdP metadata
+  ansible.builtin.set_fact:
+    idp: "{{ parsed.stdout | from_json }}"
+
+- name: Read current Dex config secret
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - -n
+      - "{{ paletteai_namespace }}"
+      - get
+      - secret
+      - "{{ dex_secret_name }}"
+      - -o
+      - "jsonpath={.data.config\\.yaml}"
+  register: dex_config_b64
+  changed_when: false
+
+- name: Decode current Dex config
+  ansible.builtin.set_fact:
+    dex_config: "{{ dex_config_b64.stdout | b64decode | from_yaml }}"
+
+- name: Build SAML connector spec
+  ansible.builtin.set_fact:
+    saml_connector:
+      type: saml
+      id: "{{ dex_connector_id }}"
+      name: "{{ dex_connector_name }}"
+      config:
+        ssoURL: "{{ idp.ssoUrl }}"
+        ssoIssuer: "{{ idp.entityId }}"
+        entityIssuer: "https://{{ paletteai_domain }}/dex/callback"
+        redirectURI: "https://{{ paletteai_domain }}/dex/callback"
+        usernameAttr: email
+        emailAttr: email
+        groupsAttr: "{{ jumpcloud_groups_attr_name }}"
+        caData: "{{ idp.caPem | b64encode }}"
+
+- name: Merge SAML connector into Dex config (replace existing jumpcloud)
+  ansible.builtin.set_fact:
+    dex_config_updated: >-
+      {{
+        dex_config | combine({
+          'connectors':
+            (dex_config.connectors | default([])
+              | rejectattr('id', 'equalto', dex_connector_id) | list)
+            + [saml_connector]
+        }, recursive=False)
+      }}
+
+- name: Encode new config
+  ansible.builtin.set_fact:
+    dex_config_b64_new: "{{ dex_config_updated | to_nice_yaml(indent=2) | b64encode }}"
+
+- name: Build JSON patch for Dex secret
+  ansible.builtin.set_fact:
+    dex_patch_json: "{{ [{'op': 'replace', 'path': '/data/config.yaml', 'value': dex_config_b64_new}] | to_json }}"
+
+- name: Patch Dex secret with new config
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - -n
+      - "{{ paletteai_namespace }}"
+      - patch
+      - secret
+      - "{{ dex_secret_name }}"
+      - --type=json
+      - -p
+      - "{{ dex_patch_json }}"
+  changed_when: true
+
+- name: Restart Dex deployment
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - -n
+      - "{{ paletteai_namespace }}"
+      - rollout
+      - restart
+      - "deployment/{{ dex_deployment_name }}"
+  changed_when: true
+
+- name: Wait for Dex rollout
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - -n
+      - "{{ paletteai_namespace }}"
+      - rollout
+      - status
+      - "deployment/{{ dex_deployment_name }}"
+      - --timeout=180s
+  changed_when: false
+
+# Canvas has a config-watcher sidecar that converts the Dex config into
+# /app/dex-json/config.json used to render the login page connector
+# buttons. The sidecar reads the config on startup; a running canvas pod
+# does not re-populate its connector list even after the Dex secret updates.
+# Restart canvas so the new connector shows up in the login UI.
+- name: Restart canvas so login UI picks up the new connector
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - -n
+      - "{{ paletteai_namespace }}"
+      - rollout
+      - restart
+      - deployment/canvas
+  changed_when: true
+
+- name: Wait for canvas rollout
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - -n
+      - "{{ paletteai_namespace }}"
+      - rollout
+      - status
+      - deployment/canvas
+      - --timeout=180s
+  changed_when: false

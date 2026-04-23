@@ -1,0 +1,211 @@
+---
+# =============================================================================
+# PaletteAI <-> JumpCloud SAML SSO teardown
+#
+# SCOPE:
+#   JumpCloud: SAML app whose ssoUrl matches https://sso.jumpcloud.com/saml2/{slug}
+#              (default slug: "paletteai")
+#   JumpCloud: user groups that are BOTH associated with that app AND tagged
+#              with "Managed by paletteai-jumpcloud-sso playbook (tenant: <name>)".
+#              Pre-existing groups (no marker) are only disassociated, never deleted.
+#              This is important because Palette's SSO playbook creates the same
+#              group names; they must NOT be deleted here.
+#   Dex:       SAML connector with id "jumpcloud" is removed; Dex is restarted.
+#   Canvas:    impersonationProxy.groupsMode is left as-is (harmless if no SSO).
+#   Cluster:   PaletteAI Tenant + Project CRs for each tenant in paletteai_tenants
+#              are deleted (opt-in via paletteai_tenants_teardown=true).
+#
+# It will NEVER:
+#   - Delete any other JumpCloud application
+#   - Delete any JumpCloud user group this playbook did not create
+#   - Delete any JumpCloud user
+#   - Touch the Palette tenants or their SSO config
+# =============================================================================
+
+- name: Teardown PaletteAI <-> JumpCloud SAML SSO
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  # Variables are defined in inventory/group_vars/all.yml. Every value can be
+  # overridden at runtime via the corresponding env var.
+
+  pre_tasks:
+    - name: Validate required inputs
+      ansible.builtin.assert:
+        that:
+          - jumpcloud_api_key | length > 0
+          - paletteai_domain | length > 0
+        fail_msg: >-
+          Missing required variables. Set them in
+          inventory/group_vars/all.yml or as env vars
+          (JUMPCLOUD_API_KEY, PALETTEAI_DOMAIN).
+
+  tasks:
+    # --- JumpCloud side ---
+    - name: List JumpCloud applications
+      ansible.builtin.uri:
+        url: "https://console.jumpcloud.com/api/applications?limit=100"
+        headers:
+          x-api-key: "{{ jumpcloud_api_key }}"
+        return_content: true
+      register: jc_apps
+
+    - name: Find target PaletteAI app by exact ssoUrl
+      ansible.builtin.set_fact:
+        target_app: >-
+          {{ jc_apps.json['results'] |
+             selectattr('ssoUrl', 'defined') |
+             selectattr('ssoUrl', 'equalto', jumpcloud_idp_url) |
+             list | first | default({}) }}
+
+    - name: Get groups currently associated with the app
+      when: target_app._id is defined
+      ansible.builtin.uri:
+        url: "https://console.jumpcloud.com/api/v2/applications/{{ target_app._id }}/usergroups"
+        headers:
+          x-api-key: "{{ jumpcloud_api_key }}"
+        return_content: true
+      register: app_groups_raw
+
+    - name: Extract associated group IDs
+      when: target_app._id is defined
+      ansible.builtin.set_fact:
+        associated_group_ids: >-
+          {{ (app_groups_raw.json | default([])) |
+             selectattr('type', 'equalto', 'user_group') |
+             map(attribute='id') | list }}
+
+    - name: Fetch full details of each associated group
+      when: target_app._id is defined
+      ansible.builtin.uri:
+        url: "https://console.jumpcloud.com/api/v2/usergroups/{{ item }}"
+        headers:
+          x-api-key: "{{ jumpcloud_api_key }}"
+        return_content: true
+      register: group_details
+      loop: "{{ associated_group_ids | default([]) }}"
+
+    - name: Identify owned-and-marked groups (description starts with marker)
+      when: target_app._id is defined
+      ansible.builtin.set_fact:
+        groups_to_delete: >-
+          {{ (group_details.results | default([])) |
+             map(attribute='json') |
+             selectattr('description', 'defined') |
+             selectattr('description', 'match', '^' ~ (jumpcloud_group_marker | regex_escape)) |
+             list }}
+
+    - name: Delete PaletteAI SAML app
+      when: target_app._id is defined
+      ansible.builtin.uri:
+        url: "https://console.jumpcloud.com/api/applications/{{ target_app._id }}"
+        method: DELETE
+        headers:
+          x-api-key: "{{ jumpcloud_api_key }}"
+        status_code: [200, 204]
+
+    - name: Delete owned-and-associated groups
+      when: target_app._id is defined
+      ansible.builtin.uri:
+        url: "https://console.jumpcloud.com/api/v2/usergroups/{{ item.id }}"
+        method: DELETE
+        headers:
+          x-api-key: "{{ jumpcloud_api_key }}"
+        status_code: [200, 204]
+      loop: "{{ groups_to_delete | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Record deletion summary
+      ansible.builtin.set_fact:
+        deleted_group_names: "{{ (groups_to_delete | default([])) | map(attribute='name') | list }}"
+        preserved_group_names: >-
+          {{ ((group_details.results | default([])) | map(attribute='json') | list) |
+             rejectattr('description', 'match', '^' ~ (jumpcloud_group_marker | regex_escape)) |
+             map(attribute='name') | list }}
+
+    # --- Dex side ---
+    - name: Check for kubectl
+      ansible.builtin.command: which kubectl
+      register: kubectl_check
+      failed_when: kubectl_check.rc != 0
+      changed_when: false
+
+    - name: Read current Dex config secret
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - -n
+          - "{{ paletteai_namespace }}"
+          - get
+          - secret
+          - "{{ dex_secret_name }}"
+          - -o
+          - "jsonpath={.data.config\\.yaml}"
+      register: dex_config_b64
+      changed_when: false
+      failed_when: false
+
+    - name: Remove SAML connector from Dex config and restart
+      when: dex_config_b64.stdout | default('') | length > 0
+      block:
+        - name: Decode current Dex config
+          ansible.builtin.set_fact:
+            dex_config: "{{ dex_config_b64.stdout | b64decode | from_yaml }}"
+
+        - name: Rebuild Dex config without our connector
+          ansible.builtin.set_fact:
+            dex_config_updated: >-
+              {{ dex_config | combine({
+                   'connectors': (dex_config.connectors | default([])
+                     | rejectattr('id', 'equalto', dex_connector_id) | list)
+                 }, recursive=False) }}
+
+        - name: Patch Dex secret (remove SAML connector)
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - -n
+              - "{{ paletteai_namespace }}"
+              - patch
+              - secret
+              - "{{ dex_secret_name }}"
+              - --type=json
+              - -p
+              - "{{ [{'op':'replace','path':'/data/config.yaml','value': (dex_config_updated | to_nice_yaml(indent=2) | b64encode)}] | to_json }}"
+          changed_when: true
+
+        - name: Restart Dex deployment
+          ansible.builtin.command:
+            argv:
+              - kubectl
+              - -n
+              - "{{ paletteai_namespace }}"
+              - rollout
+              - restart
+              - "deployment/{{ dex_deployment_name }}"
+          changed_when: true
+
+    # --- Tenant CRs (opt-in) ---
+    - name: Delete PaletteAI Tenant + Project CRs (opt-in)
+      when: paletteai_tenants_teardown | default(false) | bool
+      ansible.builtin.command: "kubectl delete -n {{ paletteai_namespace }} --ignore-not-found {{ item.0 }} {{ item.1.name }}"
+      loop: "{{ ['tenant','project'] | product(paletteai_tenants | default([])) | list }}"
+      loop_control:
+        label: "{{ item.0 }}/{{ item.1.name }}"
+      changed_when: true
+
+  post_tasks:
+    - name: Teardown summary
+      ansible.builtin.debug:
+        msg:
+          - "============================================"
+          - " PaletteAI SAML SSO Teardown Complete"
+          - "============================================"
+          - "JumpCloud app deleted:     {{ 'yes (' + target_app._id + ')' if target_app._id is defined else 'no (not found)' }}"
+          - "JumpCloud groups deleted:  {{ deleted_group_names | default([]) }}"
+          - "JumpCloud groups preserved: {{ preserved_group_names | default([]) }}"
+          - "Dex SAML connector:        removed (if present)"
+          - "PaletteAI Tenant CRs:      {{ 'deleted' if (paletteai_tenants_teardown | default(false) | bool) else 'preserved (set paletteai_tenants_teardown=true to delete)' }}"
+          - "============================================"

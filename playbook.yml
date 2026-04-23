@@ -1,0 +1,107 @@
+---
+# =============================================================================
+# PaletteAI <-> JumpCloud SAML SSO automation
+#
+# Provisions a JumpCloud SAML application for PaletteAI (single app, shared
+# by all tenants), ensures per-tenant JumpCloud user groups exist and are
+# associated with the app, configures the Dex SAML connector, fixes the
+# canvas impersonation proxy so SAML-returned groups are honored, and
+# reconciles the PaletteAI Tenant + Project CRs with group→admin mappings.
+#
+# Group sharing with Palette:
+#   ansible/palette_saml_sso/ creates JumpCloud user groups named
+#   "<tenant>-SpectroTeam" (e.g. default-SpectroTeam, ISC-SpectroTeam).
+#   Point paletteai_tenants[].jumpcloudGroup at those same group names so a
+#   user with access to the default Palette tenant automatically has access
+#   to the default PaletteAI tenant. Groups are reused, not duplicated.
+#
+# Configuration lives in inventory/group_vars/all.yml. Every value can be
+# overridden at runtime via the matching env var of the same uppercased name.
+#
+# Usage:
+#   ansible-playbook playbook.yml
+# =============================================================================
+
+- name: Integrate PaletteAI with JumpCloud SAML via Dex
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  pre_tasks:
+    - name: Validate required inputs
+      ansible.builtin.assert:
+        that:
+          - jumpcloud_api_key | length > 0
+          - paletteai_domain | length > 0
+          - paletteai_tenants | length > 0
+        fail_msg: >-
+          Missing required variables. Set them in
+          inventory/group_vars/all.yml or as env vars
+          (JUMPCLOUD_API_KEY, PALETTEAI_DOMAIN) and populate paletteai_tenants
+          as a list of {name, displayName, jumpcloudGroup, members?}.
+
+    - name: Validate each tenant spec
+      ansible.builtin.assert:
+        that:
+          - item.name is defined and item.name | length > 0
+          - item.displayName is defined and item.displayName | length > 0
+          - item.jumpcloudGroup is defined and item.jumpcloudGroup | length > 0
+        fail_msg: "Each tenant needs name, displayName, jumpcloudGroup. Got: {{ item }}"
+      loop: "{{ paletteai_tenants }}"
+
+    - name: Check for kubectl
+      ansible.builtin.command: which kubectl
+      register: kubectl_check
+      failed_when: kubectl_check.rc != 0
+      changed_when: false
+
+    - name: Check kubectl is pointed at the PaletteAI cluster
+      ansible.builtin.command: "kubectl get ns {{ paletteai_namespace }}"
+      register: ns_check
+      failed_when: ns_check.rc != 0
+      changed_when: false
+
+  # =============================================================================
+  # 1) JumpCloud SAML application (single app shared by all tenants)
+  # 2) JumpCloud user groups (one per tenant) + members, all associated with app
+  # 3) Activate the app and fetch IdP metadata XML
+  # 4) Ensure Dex ingress is reachable at {PALETTEAI_DOMAIN}/dex
+  # 5) Fix canvas impersonation proxy (groupsMode=passthrough)
+  # 6) Patch Dex secret with SAML connector and restart Dex
+  # 7) Reconcile PaletteAI Tenant CRs with group→admin mapping
+  # =============================================================================
+  tasks:
+    - name: Create/update JumpCloud SAML application
+      ansible.builtin.include_tasks: tasks/jumpcloud_app.yml
+
+    - name: Create/update JumpCloud user groups (one per tenant)
+      ansible.builtin.include_tasks: tasks/jumpcloud_groups.yml
+
+    - name: Ensure Dex ingress is bound to PaletteAI host
+      ansible.builtin.include_tasks: tasks/dex_ingress.yml
+
+    - name: Fix canvas impersonation proxy (groupsMode=passthrough)
+      ansible.builtin.include_tasks: tasks/canvas_impersonation.yml
+
+    - name: Configure Dex SAML connector
+      ansible.builtin.include_tasks: tasks/dex_connector.yml
+
+    - name: Reconcile PaletteAI Tenant CRs
+      ansible.builtin.include_tasks: tasks/tenants.yml
+
+  post_tasks:
+    - name: Display summary
+      ansible.builtin.debug:
+        msg:
+          - "============================================"
+          - " PaletteAI SSO Configuration Complete"
+          - "============================================"
+          - "JumpCloud App:     {{ jumpcloud_app_label }} ({{ jumpcloud_app_id }})"
+          - "JumpCloud IdP URL: {{ jumpcloud_idp_url }}"
+          - "Dex connector:     {{ dex_connector_id }} ({{ dex_connector_name }})"
+          - ""
+          - "Tenant ↔ JumpCloud group mapping:"
+          - "{% for t in paletteai_tenants %}  {{ t.name }} ← {{ t.jumpcloudGroup }}{% if not loop.last %}\n{% endif %}{% endfor %}"
+          - ""
+          - "Login URL: https://{{ paletteai_domain }}/ai → click 'Log in with {{ dex_connector_name }}'"
+          - "============================================"

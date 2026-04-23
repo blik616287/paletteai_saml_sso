@@ -1,0 +1,53 @@
+---
+# =============================================================================
+# Ensure canvas-config's impersonationProxy.groupsMode is set to passthrough
+# so that groups returned by Dex (e.g. default-SpectroTeam, ISC-SpectroTeam)
+# are forwarded as K8s impersonation groups. The Helm chart ships with
+# groupsMode: "map" and an empty groupMap, which silently drops all SAML
+# groups and results in "No impersonation groups found for user" errors
+# for any user who's not explicitly in dexGroupMap.
+# =============================================================================
+- name: Read current canvas-config
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - -n
+      - "{{ paletteai_namespace }}"
+      - get
+      - secret
+      - canvas-config
+      - -o
+      - "jsonpath={.data.canvas-config\\.json}"
+  register: canvas_config_b64
+  changed_when: false
+
+- name: Parse current canvas-config
+  ansible.builtin.set_fact:
+    canvas_config: "{{ canvas_config_b64.stdout | b64decode | from_json }}"
+
+- name: Update impersonationProxy.groupsMode to passthrough
+  ansible.builtin.set_fact:
+    canvas_config_new: >-
+      {{ canvas_config | combine({
+           'impersonationProxy': (canvas_config.impersonationProxy | default({}))
+              | combine({'groupsMode': 'passthrough'})
+         }, recursive=False) }}
+
+- name: Encode new canvas-config
+  ansible.builtin.set_fact:
+    canvas_config_b64_new: "{{ canvas_config_new | to_json | b64encode }}"
+
+- name: Patch canvas-config secret
+  when: canvas_config.impersonationProxy.groupsMode | default('') != 'passthrough'
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - -n
+      - "{{ paletteai_namespace }}"
+      - patch
+      - secret
+      - canvas-config
+      - --type=json
+      - -p
+      - "{{ [{'op':'replace','path':'/data/canvas-config.json','value': canvas_config_b64_new}] | to_json }}"
+  changed_when: true

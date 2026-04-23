@@ -1,0 +1,73 @@
+---
+# =============================================================================
+# PaletteAI <-> JumpCloud SAML SSO configuration
+#
+# Every value below can be overridden at runtime via an environment variable
+# of the same uppercased name (e.g. PALETTEAI_DOMAIN). Edit this file for
+# persistent per-environment defaults; use env vars for one-off overrides or
+# CI/CD secret injection.
+#
+# kubectl must be pointed at the PaletteAI EKS cluster before running the
+# playbook, e.g.:
+#   aws eks update-kubeconfig --name spectroihmeae-ue2-paletteai \
+#       --region us-east-2 --profile spectro
+# =============================================================================
+
+# --- JumpCloud -------------------------------------------------------------
+jumpcloud_api_key: "{{ lookup('env', 'JUMPCLOUD_API_KEY') }}"
+
+# Display label for the JumpCloud Custom SAML 2.0 application.
+jumpcloud_app_label: "{{ lookup('env', 'JUMPCLOUD_APP_LABEL') | default('PaletteAI', true) }}"
+
+# URL slug JumpCloud uses in the SSO URL — must be globally unique across
+# this JumpCloud org.
+jumpcloud_idp_url_slug: "{{ lookup('env', 'JUMPCLOUD_IDP_URL_SLUG') | default('paletteai', true) }}"
+
+# SAML groups attribute sent by JumpCloud in the assertion. The Dex SAML
+# connector's groupsAttr must match this.
+jumpcloud_groups_attr_name: "{{ lookup('env', 'JUMPCLOUD_GROUPS_ATTR') | default('memberOf', true) }}"
+
+# Marker placed in JumpCloud group descriptions so teardown can safely
+# identify groups this playbook created (vs pre-existing groups that must
+# be preserved — notably the ones created by palette_saml_sso).
+jumpcloud_group_marker: "Managed by paletteai-jumpcloud-sso playbook"
+
+# --- PaletteAI -------------------------------------------------------------
+paletteai_domain: "{{ lookup('env', 'PALETTEAI_DOMAIN') | default('paletteai.isc-spectro-dev.click', true) }}"
+paletteai_namespace: "{{ lookup('env', 'PALETTEAI_NAMESPACE') | default('mural-system', true) }}"
+
+# --- Dex -------------------------------------------------------------------
+dex_connector_id: "jumpcloud"
+dex_connector_name: "JumpCloud"
+dex_secret_name: "dex"
+dex_deployment_name: "dex"
+
+# --- Tenants ---------------------------------------------------------------
+# Each entry becomes a PaletteAI Tenant CR + Project CR. The
+# jumpcloudGroup field points at the JumpCloud user group whose members
+# should get admin access to the tenant. Reuse the <tenant>-SpectroTeam
+# groups created by ansible/palette_saml_sso/ so one JumpCloud group
+# grants access to both Palette and PaletteAI for the same tenant.
+paletteai_tenants:
+  - name: default
+    displayName: "Default Tenant"
+    jumpcloudGroup: "default-SpectroTeam"
+    members:
+      - marty@insightsoftmax.net
+
+  - name: isc
+    displayName: "ISC"
+    jumpcloudGroup: "ISC-SpectroTeam"
+    members:
+      - marty@insightsoftmax.net
+
+# Set true to delete Tenant CRs not listed in paletteai_tenants during the
+# main playbook run (dangerous — opt-in).
+paletteai_tenants_prune: "{{ lookup('env', 'PALETTEAI_TENANTS_PRUNE') | default(false, true) | bool }}"
+
+# Set true to delete the Tenant + Project CRs during teardown. Off by default
+# because a tenant may contain user workloads.
+paletteai_tenants_teardown: "{{ lookup('env', 'PALETTEAI_TENANTS_TEARDOWN') | default(false, true) | bool }}"
+
+# --- Derived values (do not edit) ------------------------------------------
+jumpcloud_idp_url: "https://sso.jumpcloud.com/saml2/{{ jumpcloud_idp_url_slug }}"

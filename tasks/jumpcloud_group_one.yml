@@ -1,0 +1,137 @@
+---
+# Per-tenant group creation + member sync + app association. Invoked via
+# include_tasks with `tenant` set to the current tenant dict.
+
+- name: "[{{ tenant.name }}] Find target JumpCloud group by exact name"
+  ansible.builtin.set_fact:
+    tenant_group: >-
+      {{ all_jc_groups |
+         selectattr('name', 'equalto', tenant.jumpcloudGroup) |
+         list | first | default({}) }}
+
+- name: "[{{ tenant.name }}] Create JumpCloud user group if missing"
+  when: tenant_group.id is not defined
+  ansible.builtin.uri:
+    url: "https://console.jumpcloud.com/api/v2/usergroups"
+    method: POST
+    headers:
+      x-api-key: "{{ jumpcloud_api_key }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      name: "{{ tenant.jumpcloudGroup }}"
+      type: "user_group"
+      description: "{{ jumpcloud_group_marker }} (tenant: {{ tenant.name }})"
+    status_code: [200, 201]
+    return_content: true
+  register: group_created
+
+- name: "[{{ tenant.name }}] Set JumpCloud group ID"
+  ansible.builtin.set_fact:
+    tenant_group_id: >-
+      {{ group_created.json.id
+         if group_created is defined and group_created.json is defined
+         else tenant_group.id }}
+
+- name: "[{{ tenant.name }}] Check current app associations"
+  ansible.builtin.uri:
+    url: "https://console.jumpcloud.com/api/v2/applications/{{ jumpcloud_app_id }}/usergroups"
+    headers:
+      x-api-key: "{{ jumpcloud_api_key }}"
+    return_content: true
+  register: app_current_groups
+
+- name: "[{{ tenant.name }}] Associate user group with SAML app"
+  ansible.builtin.uri:
+    url: "https://console.jumpcloud.com/api/v2/usergroups/{{ tenant_group_id }}/associations"
+    method: POST
+    headers:
+      x-api-key: "{{ jumpcloud_api_key }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      op: "add"
+      type: "application"
+      id: "{{ jumpcloud_app_id }}"
+    status_code: [200, 204, 409]
+  when: >-
+    tenant_group_id not in (app_current_groups.json | default([]) |
+      selectattr('type', 'equalto', 'user_group') |
+      map(attribute='id') | list)
+
+# =============================================================================
+# Member management (optional — tenant.members list of emails)
+# =============================================================================
+- name: "[{{ tenant.name }}] Manage members"
+  when: (tenant.members | default([]) | length) > 0
+  block:
+    - name: "[{{ tenant.name }}] Look up each JumpCloud user by email"
+      ansible.builtin.uri:
+        url: "https://console.jumpcloud.com/api/systemusers"
+        headers:
+          x-api-key: "{{ jumpcloud_api_key }}"
+        body_format: form-urlencoded
+        body:
+          "search.fields": "email"
+          "search.searchTerm": "{{ email }}"
+        return_content: true
+      register: jc_user_lookups
+      loop: "{{ tenant.members }}"
+      loop_control:
+        loop_var: email
+
+    - name: "[{{ tenant.name }}] Resolve each email to an exact JumpCloud user match"
+      ansible.builtin.set_fact:
+        resolved_user_map: >-
+          {{ resolved_user_map | default({}) | combine({
+               pair.0: ((pair.1.json.results | default([])) |
+                        selectattr('email', 'equalto', pair.0) |
+                        list | first | default(none))
+             }) }}
+      loop: "{{ tenant.members | zip(jc_user_lookups.results) | list }}"
+      loop_control:
+        loop_var: pair
+        label: "{{ pair.0 }}"
+
+    - name: "[{{ tenant.name }}] Fail if any user was not found in JumpCloud"
+      ansible.builtin.fail:
+        msg: "JumpCloud user not found for email: {{ email }}. Create them in JumpCloud first."
+      when: resolved_user_map[email] is none
+      loop: "{{ tenant.members }}"
+      loop_control:
+        loop_var: email
+
+    - name: "[{{ tenant.name }}] Fetch current group members"
+      ansible.builtin.uri:
+        url: "https://console.jumpcloud.com/api/v2/usergroups/{{ tenant_group_id }}/members"
+        headers:
+          x-api-key: "{{ jumpcloud_api_key }}"
+        return_content: true
+      register: current_members
+
+    - name: "[{{ tenant.name }}] Extract current member user IDs"
+      ansible.builtin.set_fact:
+        current_member_ids: >-
+          {{ (current_members.json | default([])) |
+             selectattr('to.type', 'defined') |
+             selectattr('to.type', 'equalto', 'user') |
+             map(attribute='to.id') | list }}
+
+    - name: "[{{ tenant.name }}] Add users to group (idempotent)"
+      ansible.builtin.uri:
+        url: "https://console.jumpcloud.com/api/v2/usergroups/{{ tenant_group_id }}/members"
+        method: POST
+        headers:
+          x-api-key: "{{ jumpcloud_api_key }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          op: "add"
+          type: "user"
+          id: "{{ user._id }}"
+        status_code: [200, 204, 409]
+      loop: "{{ tenant.members | map('extract', resolved_user_map) | list }}"
+      loop_control:
+        loop_var: user
+        label: "{{ user.email }}"
+      when: user._id not in current_member_ids
