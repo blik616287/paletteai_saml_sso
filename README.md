@@ -189,3 +189,7 @@ ansible-playbook playbook.yml
 ```
 
 Then verify in an incognito browser: log in to JumpCloud → click the `PaletteAI` tile → land in PaletteAI as a tenant member.
+
+## License
+
+[MIT](LICENSE) © 2026 Martin Forde <mforde84@gmail.com>, [Blik Labs](https://bliklabs.com).
